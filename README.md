@@ -3,6 +3,19 @@
 Fast local search over every coding-agent session on a machine: Claude Code (every
 account home), Codex and Antigravity. One SQLite file, Python standard library only.
 
+## Install
+
+Python 3.9 or newer; nothing else to install.
+
+```
+git clone https://github.com/yaroslavvb/session-local-search
+cd session-local-search
+./sls index        # the first pass reads every session: 7 GB of logs took under two minutes
+./sls serve        # then open http://127.0.0.1:31096/
+```
+
+## Use
+
 ```
 sls search "dishwasher error code"          # best match first
 sls search "kimi k3" --newest --agent claude
@@ -66,7 +79,8 @@ another machine. The index lives at `~/.local/share/session-local-search/index.s
 ## Settings
 
 `SLS_DB` (index path), `SLS_PORT` (default 31096), `SLS_HOME` (whose sessions; tests use it),
-`SLS_ACCOUNTS_TSV` (labels for account homes; default `~/git0/flush-util/claude_accounts.tsv`).
+`SLS_ACCOUNTS_TSV` (labels for account homes; default `~/git0/flush-util/claude_accounts.tsv`, the
+author's table; without one, a home's folder name is its label).
 
 ## Tests
 
