@@ -83,12 +83,12 @@ def main(argv: list[str]) -> int:
     for s in res["sessions"]:
         title = s.get("title") or (s.get("first_prompt") or "")[:80] or s["session_id"]
         print(f"■ {title}")
-        print(f"  {s.get('harness')} · {s.get('account')} · {s.get('cwd') or ''} · {(s.get('last_ts') or '')[:16]}")
+        print(f"  {s.get('harness')} · {s.get('account')} · {s.get('cwd') or ''} · {web._local(s.get('last_ts'))}")
         if s.get("url"):
             print(f"  {s['url']}")
         print(f"  {s['resume']}")
         for h in s["hits"]:
             snip = (h["snippet"] or "").replace("\x02", "«").replace("\x03", "»").replace("\n", " ")
-            print(f"    {h['role']:9} {(h['ts'] or '')[:16]}{' live' if h['live'] else ''}  {snip[:220]}")
+            print(f"    {h['role']:9} {web._local(h['ts'])}{' live' if h['live'] else ''}  {snip[:220]}")
         print()
     return 0
