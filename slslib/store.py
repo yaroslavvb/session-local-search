@@ -34,14 +34,22 @@ CREATE INDEX IF NOT EXISTS messages_path ON messages(path);
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, ts);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   text, content='messages', content_rowid='id', tokenize='porter unicode61 remove_diacritics 2');
+-- A narrow message -> session map (two integers a row), so "which sessions match" never
+-- has to read the wide message rows. Kept in step by the triggers.
+CREATE TABLE IF NOT EXISTS skeys(k INTEGER PRIMARY KEY, session_id TEXT UNIQUE);
+CREATE TABLE IF NOT EXISTS msess(id INTEGER PRIMARY KEY, k INTEGER);
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
   INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+  INSERT OR IGNORE INTO skeys(session_id) VALUES (new.session_id);
+  INSERT INTO msess(id, k) VALUES (new.id, (SELECT k FROM skeys WHERE session_id = new.session_id));
 END;
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
   INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', old.id, old.text);
+  DELETE FROM msess WHERE id = old.id;
 END;
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
+SCHEMA_VERSION = 2          # bump when the schema changes: the next index pass rebuilds
 
 # Title sources, strongest first: a name he typed, the agent's name, sessionpipe's title,
 # Claude's own generated title, an old-style summary. Below all of them: the first prompt.
@@ -62,7 +70,14 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.executescript(SCHEMA)
+    if con.execute("PRAGMA user_version").fetchone()[0] == 0 and \
+            con.execute("SELECT count(*) FROM (SELECT 1 FROM messages LIMIT 1)").fetchone()[0] == 0:
+        con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     return con
+
+
+def schema_current(con) -> bool:
+    return con.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def get_meta(con, k, default=None):
@@ -106,6 +121,13 @@ def index(full: bool = False, optimize: bool = False, log=print, path: str | Non
 
 
 def _index(full: bool, optimize: bool, log, path: str | None) -> dict:
+    if not full:
+        con = connect(path)
+        stale = not schema_current(con)
+        con.close()
+        if stale:
+            log("the index was built by an older version; rebuilding")
+            full = True
     if full:                                     # a rebuild starts from an empty file
         p = path or db_path()
         for x in (p, p + "-wal", p + "-shm"):
@@ -256,13 +278,27 @@ def resume_line(s: dict) -> str:
 
 
 SESSION_SET_CAP = 20000
-WIDEN_BELOW = 5          # widen to whole sessions only when messages alone found fewer than this
 
 
 def _sessions_matching(con, phrase: str) -> set:
+    """Session keys (integers) with a message matching `phrase`; reads only the narrow map."""
     return {r[0] for r in con.execute(
-        "SELECT DISTINCT m.session_id FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+        "SELECT DISTINCT ms.k FROM messages_fts JOIN msess ms ON ms.id = messages_fts.rowid "
         "WHERE messages_fts MATCH ? LIMIT ?", (phrase, SESSION_SET_CAP))}
+
+
+def _keys(con, sids) -> dict:
+    if not sids:
+        return {}
+    marks = ",".join("?" * len(sids))
+    return dict(con.execute(f"SELECT session_id, k FROM skeys WHERE session_id IN ({marks})", list(sids)))
+
+
+def _sids(con, keys) -> dict:
+    if not keys:
+        return {}
+    marks = ",".join("?" * len(keys))
+    return dict(con.execute(f"SELECT k, session_id FROM skeys WHERE k IN ({marks})", list(keys)))
 
 
 def search(q: str, limit: int = 20, per_session: int = 3, sort: str = "relevance",
@@ -295,6 +331,7 @@ def search(q: str, limit: int = 20, per_session: int = 3, sort: str = "relevance
         dropped = set()
         for n in neg:
             dropped |= _sessions_matching(con, n)
+        dropped = set(_sids(con, dropped).values()) if dropped else set()
         rows = con.execute(base + f"WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?",
                            args + [max(200, limit * per_session * 10)]).fetchall()
         groups: dict[str, list] = {}
@@ -309,16 +346,19 @@ def search(q: str, limit: int = 20, per_session: int = 3, sort: str = "relevance
                 order_sids.append(sid)
             if len(groups[sid]) < per_session:
                 groups[sid].append({"id": mid, "role": role, "ts": ts, "snippet": snip, "live": False})
-        if len(order_sids) < min(limit, WIDEN_BELOW) and len(pos) > 1:
+        if len(order_sids) < limit and len(pos) > 1:
             counts = {ph: con.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?",
                                       (ph,)).fetchone()[0] for ph in pos}
+            ranked = sorted(pos, key=counts.get)        # rarest first: an empty set ends it early
             common = None
-            for phrase in sorted(pos, key=counts.get):   # rarest first: empty sets end it early
+            for phrase in ranked:
                 got = _sessions_matching(con, phrase)
                 common = got if common is None else common & got
                 if not common:
                     break
-            extra = [sid for sid in (common or ()) if sid not in groups and sid not in dropped]
+            known_keys = set(_keys(con, list(groups)).values())
+            extra = [sid for k, sid in _sids(con, common or set()).items()
+                     if k not in known_keys and sid not in dropped]
             if extra:
                 meta = session_rows(con, extra)
                 extra = [sid for sid in extra
@@ -326,18 +366,32 @@ def search(q: str, limit: int = 20, per_session: int = 3, sort: str = "relevance
                          and (not account or meta.get(sid, {}).get("account") == account)]
                 extra.sort(key=lambda sid: meta.get(sid, {}).get("last_ts") or "", reverse=True)
                 extra = extra[:limit - len(order_sids)]
+                kmap = _keys(con, extra)
                 best: dict[str, list] = {sid: [] for sid in extra}
                 marks = ",".join("?" * len(extra))
-                for phrase in pos[:per_session]:     # one query per word, not per session
+                key_to_sid = {kmap[sid]: sid for sid in extra}
+                for phrase in ranked[:per_session]:   # one query per word; the narrow map filters rows
                     seen = set()
-                    for r in con.execute(base + f"WHERE messages_fts MATCH ? AND m.session_id IN ({marks}) "
-                                         "ORDER BY messages_fts.rank", [phrase] + extra):
-                        if r[1] in seen:
+                    cur = con.execute(
+                        "SELECT messages_fts.rowid, ms.k, snippet(messages_fts, 0, char(2), char(3), ' … ', 24) "
+                        "FROM messages_fts JOIN msess ms ON ms.id = messages_fts.rowid "
+                        f"WHERE messages_fts MATCH ? AND ms.k IN ({marks}) ORDER BY messages_fts.rank",
+                        [phrase] + list(key_to_sid))
+                    picked = []
+                    for rid, k, snip in cur:
+                        if k in seen:
                             continue
-                        seen.add(r[1])
-                        best[r[1]].append({"id": r[0], "role": r[2], "ts": r[3], "snippet": r[4], "live": False})
-                        if len(seen) == len(extra):
+                        seen.add(k)
+                        picked.append((rid, key_to_sid[k], snip))
+                        if len(seen) == len(key_to_sid):
                             break
+                    if picked:
+                        info = {r[0]: r[1:] for r in con.execute(
+                            f"SELECT id, role, ts FROM messages WHERE id IN ({','.join('?' * len(picked))})",
+                            [p_[0] for p_ in picked])}
+                        for rid, sid, snip in picked:
+                            role, ts = info.get(rid, (None, None))
+                            best[sid].append({"id": rid, "role": role, "ts": ts, "snippet": snip, "live": False})
                 for sid in extra:
                     groups[sid] = best[sid]
                     order_sids.append(sid)
