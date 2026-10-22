@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.yaroslavvb.session-local-search-index</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/nice</string>
+    <string>-n</string>
+    <string>19</string>
+    <string>/usr/local/bin/python3.12</string>
+    <string>/Users/yaroslavvb/git/session-local-search/sls</string>
+    <string>index</string>
+    <string>--optimize</string>
+  </array>
+  <!-- 02:50 nightly, before the 03:30 passes; Background lowers its I/O and CPU priority -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>50</integer></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>19</integer>
+  <key>StandardOutPath</key><string>/Users/yaroslavvb/Library/Logs/session-local-search-index.log</string>
+  <key>StandardErrorPath</key><string>/Users/yaroslavvb/Library/Logs/session-local-search-index.log</string>
+</dict>
+</plist>
